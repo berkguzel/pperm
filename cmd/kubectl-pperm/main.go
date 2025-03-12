@@ -18,6 +18,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Skip validation if help is requested
+	if opts.Help {
+		return
+	}
+
 	// Validate required fields
 	if opts.Namespace == "" {
 		fmt.Fprintln(os.Stderr, "Error: namespace (-n) is required")
