@@ -15,6 +15,7 @@ type Options struct {
 	ShowPolicies  bool
 	ShowPerms     bool
 	InspectPolicy bool
+	RiskOnly      bool
 	KubeConfig    string
 }
 
@@ -44,6 +45,8 @@ func (o *Options) Parse() error {
 		switch arg {
 		case "--inspect-policy", "-i":
 			o.InspectPolicy = true
+		case "--risk-only", "-r":
+			o.RiskOnly = true
 		case "--role":
 			o.ShowRole = true
 		case "--policies":

@@ -19,27 +19,60 @@ var (
 )
 
 func PrintPermissions(permissions []types.PodPermissions) {
-	for _, perm := range permissions {
-		fmt.Printf("\n%s Pod: %s (Namespace: %s)\n", bold("→"), perm.PodName, perm.Namespace)
-		fmt.Printf("  IAM Role: %s\n", perm.IAMRole)
+	// Add debug to see what we're getting
+	fmt.Printf("Debug: Received %d pod permissions\n", len(permissions))
 
-		for _, policy := range perm.Policies {
+	for _, podPerm := range permissions {
+		fmt.Printf("\n%s Pod: %s (Namespace: %s)\n", bold("→"), podPerm.PodName, podPerm.Namespace)
+		fmt.Printf("  Service Account: %s\n", podPerm.ServiceAccount)
+		fmt.Printf("  IAM Role: %s\n", podPerm.IAMRole)
+
+		fmt.Printf("Debug: Pod has %d policies\n", len(podPerm.Policies))
+
+		for _, policy := range podPerm.Policies {
 			fmt.Printf("\n  Policy: %s\n", policy.Name)
-			if policy.Arn != "" {
-				fmt.Printf("  ARN: %s\n", policy.Arn)
-			}
+			fmt.Printf("  ARN: %s\n", policy.Arn)
+			fmt.Printf("  Permissions:\n")
 
-			fmt.Println("  Permissions:")
+			fmt.Printf("Debug: Policy has %d permissions\n", len(policy.Permissions))
+
 			for _, perm := range policy.Permissions {
-				printPermissionLine(perm)
+				icon := checkmark
+				if perm.IsHighRisk {
+					icon = danger
+				} else if perm.IsBroad {
+					icon = warning
+				}
+
+				resource := perm.Resource
+				if resource == "*" {
+					resource = "all resources"
+				}
+
+				desc := ""
+				if perm.IsBroad {
+					if strings.HasSuffix(perm.Action, ":*") {
+						desc = " (broad permissions)"
+					}
+					if perm.Resource == "*" {
+						desc = " (all resources)"
+					}
+				}
+
+				fmt.Printf("    %s %-30s on %s%s\n",
+					icon,
+					perm.Action,
+					resource,
+					desc,
+				)
 			}
 		}
-		fmt.Println()
 	}
 }
 
 func printPermissionLine(perm types.PermissionDisplay) {
 	var icon string
+	var description string
 
 	switch {
 	case perm.IsHighRisk:
@@ -51,15 +84,27 @@ func printPermissionLine(perm types.PermissionDisplay) {
 	}
 
 	// Format the resource string
-	resourceStr := perm.Resource
-	if resourceStr == "*" {
-		resourceStr = "all resources"
+	resourceStr := formatResource(perm.Resource)
+
+	// Add description for broad permissions
+	if perm.IsBroad {
+		if strings.HasSuffix(perm.Action, ":*") {
+			description = " (broad permissions)"
+		}
+		if perm.Resource == "*" {
+			description = " (all resources)"
+		}
 	}
 
 	// Pad the action string for alignment
 	actionPadded := fmt.Sprintf("%-20s", perm.Action)
 
-	fmt.Printf("    %s %s on %s\n", icon, actionPadded, resourceStr)
+	fmt.Printf("    %s %s on %s%s\n",
+		icon,
+		actionPadded,
+		resourceStr,
+		description,
+	)
 }
 
 // Helper function to format permission details
@@ -79,8 +124,10 @@ func formatPermissionDetails(action, resource string) string {
 }
 
 func formatResource(resource string) string {
-	if resource == "*" {
+	switch resource {
+	case "*":
 		return "all resources"
+	default:
+		return resource
 	}
-	return resource
 }

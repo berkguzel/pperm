@@ -1,11 +1,20 @@
 package types
 
-type PermissionDisplay struct {
+type Permission struct {
 	Action     string
 	Resource   string
 	Effect     string
 	IsBroad    bool
 	IsHighRisk bool
+}
+
+type PermissionDisplay struct {
+	Action       string
+	Resource     string
+	Effect       string
+	IsBroad      bool
+	IsHighRisk   bool
+	HasCondition bool
 }
 
 type Policy struct {

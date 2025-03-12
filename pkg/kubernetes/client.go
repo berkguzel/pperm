@@ -17,35 +17,22 @@ type Client struct {
 	clientset *kubernetes.Clientset
 }
 
-func NewClient(kubeconfigPath string) (*Client, error) {
-	var config *rest.Config
-	var err error
-
-	// If running inside cluster
-	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
-		config, err = rest.InClusterConfig()
-	} else {
-		// Get kubeconfig path
-		if kubeconfigPath == "" {
-			if envPath := os.Getenv("KUBECONFIG"); envPath != "" {
-				kubeconfigPath = envPath
-			} else {
-				homeDir, _ := os.UserHomeDir()
-				kubeconfigPath = filepath.Join(homeDir, ".kube", "config")
-			}
-		}
-
-		// Use the kubeconfig file
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-	}
-
+func NewClient() (*Client, error) {
+	config, err := rest.InClusterConfig()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create config: %v", err)
+		kubeconfig := os.Getenv("KUBECONFIG")
+		if kubeconfig == "" {
+			kubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
+		}
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create clientset: %v", err)
+		return nil, err
 	}
 
 	return &Client{clientset: clientset}, nil
