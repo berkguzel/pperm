@@ -13,24 +13,6 @@ func Print(perms []types.PodPermissions, opts *options.Options) error {
 		return inspectPolicy(perms, opts)
 	}
 
-	if opts.ShowRole {
-		fmt.Println(perms[0].IAMRole)
-		return nil
-	}
-
-	if opts.ShowPolicies {
-		for _, perm := range perms {
-			fmt.Printf("\nPod: %s\n", perm.PodName)
-			fmt.Printf("Service Account: %s\n", perm.ServiceAccount)
-			fmt.Printf("IAM Role: %s\n", perm.IAMRole)
-			fmt.Printf("\nAttached Policies:\n")
-			for _, policy := range perm.Policies {
-				fmt.Printf("- %s\n  ARN: %s\n", policy.Name, policy.Arn)
-			}
-		}
-		return nil
-	}
-
 	if opts.ShowPerms || opts.RiskOnly {
 		// Calculate max resource length
 		maxResourceLen := 52 // minimum width
