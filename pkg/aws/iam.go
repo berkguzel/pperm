@@ -3,6 +3,9 @@ package aws
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/berkguzel/pperm/pkg/types"
@@ -20,73 +23,84 @@ func (c *Client) GetRolePolicies(ctx context.Context, roleArn string) ([]types.P
 	roleName := getRoleNameFromARN(roleArn)
 	var policies []types.Policy
 
-	// Get inline policies
-	inlinePolicies, err := c.iamClient.ListRolePolicies(ctx, &iam.ListRolePoliciesInput{
+	result, err := c.iamClient.ListAttachedRolePolicies(ctx, &iam.ListAttachedRolePoliciesInput{
 		RoleName: &roleName,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to list policies: %v", err)
 	}
 
-	for _, policyName := range inlinePolicies.PolicyNames {
-		policy, err := c.iamClient.GetRolePolicy(ctx, &iam.GetRolePolicyInput{
-			RoleName:   &roleName,
-			PolicyName: &policyName,
-		})
-		if err != nil {
-			continue
-		}
-
-		// Parse and format permissions
-		var doc PolicyDocument
-		if err := json.Unmarshal([]byte(*policy.PolicyDocument), &doc); err != nil {
-			continue
-		}
-		perms := formatPermissions(doc.Statement)
-
-		var displayPerms []types.PermissionDisplay
-		for _, p := range perms {
-			displayPerms = append(displayPerms, types.PermissionDisplay{
-				Action:     p.Action,
-				Resource:   p.Resource,
-				IsBroad:    p.IsBroad,
-				IsHighRisk: p.IsHighRisk,
-			})
-		}
-
-		policies = append(policies, convertPolicyDocument(policyName, "", displayPerms))
-	}
-
-	// Get attached policies
-	attachedPolicies, err := c.iamClient.ListAttachedRolePolicies(ctx, &iam.ListAttachedRolePoliciesInput{
-		RoleName: &roleName,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	for _, policy := range attachedPolicies.AttachedPolicies {
+	for _, policy := range result.AttachedPolicies {
 		perms, err := c.GetPolicyPermissions(ctx, *policy.PolicyArn)
 		if err != nil {
+			fmt.Printf("Error getting permissions for policy %s: %v\n", *policy.PolicyArn, err)
 			continue
-		}
-
-		var displayPerms []types.PermissionDisplay
-		for _, p := range perms {
-			displayPerms = append(displayPerms, types.PermissionDisplay{
-				Action:     p.Action,
-				Resource:   p.Resource,
-				IsBroad:    p.IsBroad,
-				IsHighRisk: p.IsHighRisk,
-			})
 		}
 
 		policies = append(policies, types.Policy{
 			Name:        *policy.PolicyName,
 			Arn:         *policy.PolicyArn,
-			Permissions: displayPerms,
+			Permissions: perms,
 		})
 	}
 
 	return policies, nil
+}
+
+// Only call this when permissions are needed
+func (c *Client) GetPolicyPermissions(ctx context.Context, policyArn string) ([]types.PermissionDisplay, error) {
+	policy, err := c.iamClient.GetPolicy(ctx, &iam.GetPolicyInput{
+		PolicyArn: &policyArn,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get policy: %v", err)
+	}
+
+	policyVersion, err := c.iamClient.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
+		PolicyArn: &policyArn,
+		VersionId: policy.Policy.DefaultVersionId,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get policy version: %v", err)
+	}
+
+	decodedDoc, err := url.QueryUnescape(*policyVersion.PolicyVersion.Document)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode policy document: %v", err)
+	}
+
+	var doc PolicyDocument
+	if err := json.Unmarshal([]byte(decodedDoc), &doc); err != nil {
+		return nil, fmt.Errorf("failed to parse policy document: %v", err)
+	}
+
+	return formatPermissions(doc.Statement), nil
+}
+
+func formatPermissions(statements []Statement) []types.PermissionDisplay {
+	var permissions []types.PermissionDisplay
+
+	for _, stmt := range statements {
+		actions := getActions(stmt.Action)
+		resources := getResources(stmt.Resource)
+		hasCondition := len(stmt.Condition) > 0
+
+		for _, action := range actions {
+			for _, resource := range resources {
+				isBroad := strings.Contains(action, "*") || strings.Contains(resource, "*")
+				isHighRisk := isHighRiskService(action)
+
+				permissions = append(permissions, types.PermissionDisplay{
+					Action:       action,
+					Resource:     resource,
+					Effect:       stmt.Effect,
+					IsBroad:      isBroad,
+					IsHighRisk:   isHighRisk,
+					HasCondition: hasCondition,
+				})
+			}
+		}
+	}
+
+	return permissions
 }
