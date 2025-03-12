@@ -10,7 +10,7 @@ import (
 
 func Print(perms []types.PodPermissions, opts *options.Options) error {
 	if opts.InspectPolicy {
-		return inspectPolicy(perms)
+		return inspectPolicy(perms, opts)
 	}
 
 	if opts.ShowRole {
@@ -31,7 +31,7 @@ func Print(perms []types.PodPermissions, opts *options.Options) error {
 		return nil
 	}
 
-	if opts.ShowPerms {
+	if opts.ShowPerms || opts.RiskOnly {
 		// Calculate max resource length
 		maxResourceLen := 52 // minimum width
 		for _, perm := range perms {
@@ -56,6 +56,11 @@ func Print(perms []types.PodPermissions, opts *options.Options) error {
 						scope = " 🚨 "
 					}
 
+					// Skip if risk-only flag is set and permission doesn't have broad scope
+					if opts.RiskOnly && scope != " 🚨 " {
+						continue
+					}
+
 					fmt.Printf("| %-30s | %-35s | %-*s | %-4s |\n",
 						truncateString(policy.Name, 30),
 						p.Action,
@@ -77,6 +82,20 @@ func Print(perms []types.PodPermissions, opts *options.Options) error {
 
 	for _, perm := range perms {
 		for _, policy := range perm.Policies {
+			// Skip if risk-only flag is set and no high-risk permissions
+			if opts.RiskOnly {
+				hasRisk := false
+				for _, p := range policy.Permissions {
+					if p.IsBroad || p.IsHighRisk {
+						hasRisk = true
+						break
+					}
+				}
+				if !hasRisk {
+					continue
+				}
+			}
+
 			// Determine access level based on permissions and policy name
 			accessLevel := determineAccessLevel(policy.Permissions, policy.Name)
 			// Determine service based on actions in permissions
@@ -252,7 +271,7 @@ func centerText(text string, width int) string {
 	return strings.Repeat(" ", leftPad) + text + strings.Repeat(" ", rightPad)
 }
 
-func inspectPolicy(perms []types.PodPermissions) error {
+func inspectPolicy(perms []types.PodPermissions, opts *options.Options) error {
 	if len(perms) == 0 {
 		fmt.Println("No pod permissions found")
 		return nil
@@ -306,6 +325,11 @@ func inspectPolicy(perms []types.PodPermissions) error {
 		scope := " ✅ "
 		if p.IsBroad || p.IsHighRisk {
 			scope = " 🚨 "
+		}
+
+		// Skip if risk-only flag is set and permission doesn't have broad scope
+		if opts.RiskOnly && scope != " 🚨 " {
+			continue
 		}
 
 		fmt.Printf("| %-30s | %-35s | %-*s | %-4s |\n",
