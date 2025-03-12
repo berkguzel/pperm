@@ -5,27 +5,128 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/berkguzel/pperm/pkg/types"
 )
 
-var (
-	// Cache for policy permissions to avoid repeated API calls
-	policyCache     = make(map[string]cacheEntry)
-	cacheMutex      sync.RWMutex
-	cacheExpiration = 24 * time.Hour // Cache entries expire after 24 hours
+// BatchSize determines how many policies to process in parallel
+const BatchSize = 10
+
+// Cache configuration
+const (
+	cacheExpiration       = 1 * time.Minute
+	maxCacheSize          = 1000
+	cacheSaveInterval     = 5 * time.Minute
+	maxConcurrentAPICalls = 8
 )
+
+// Add timeout constants
+const (
+	listPoliciesTimeout  = 2 * time.Second
+	getPolicyTimeout     = 1 * time.Second
+	resultCollectTimeout = 3 * time.Second
+	apiOperationTimeout  = 750 * time.Millisecond
+)
+
+// Add at the top of the file after imports
+const cacheFileName = ".pperm_cache.json"
 
 type cacheEntry struct {
 	permissions []types.PermissionDisplay
 	timestamp   time.Time
 	versionId   string
-	document    PolicyDocument // Cache the parsed document to avoid repeated parsing
+	document    PolicyDocument
+	lastAccess  time.Time
+}
+
+// Cache with TTL and LRU eviction
+type Cache struct {
+	sync.RWMutex
+	items    map[string]cacheEntry
+	size     int
+	hits     int64
+	misses   int64
+	evicted  int64
+	lastSave time.Time
+}
+
+var policyCache = &Cache{
+	items: make(map[string]cacheEntry),
+}
+
+type persistentCache struct {
+	Entries  map[string]cacheEntry `json:"entries"`
+	LastSave time.Time             `json:"last_save"`
+}
+
+func (c *Cache) Get(key string) (cacheEntry, bool) {
+	c.RLock()
+	defer c.RUnlock()
+
+	entry, exists := c.items[key]
+	if !exists {
+		atomic.AddInt64(&c.misses, 1)
+		return cacheEntry{}, false
+	}
+
+	// Check if entry has expired
+	if time.Since(entry.timestamp) > cacheExpiration {
+		atomic.AddInt64(&c.evicted, 1)
+		delete(c.items, key)
+		c.size--
+		return cacheEntry{}, false
+	}
+
+	// Update last access time
+	entry.lastAccess = time.Now()
+	c.items[key] = entry
+	atomic.AddInt64(&c.hits, 1)
+
+	return entry, true
+}
+
+func (c *Cache) Set(key string, entry cacheEntry) {
+	c.Lock()
+	defer c.Unlock()
+
+	// If cache is full, remove least recently used entries
+	if c.size >= maxCacheSize && c.items[key].timestamp.IsZero() {
+		lru := time.Now()
+		var lruKey string
+		for k, v := range c.items {
+			if v.lastAccess.Before(lru) {
+				lru = v.lastAccess
+				lruKey = k
+			}
+		}
+		delete(c.items, lruKey)
+		c.size--
+		atomic.AddInt64(&c.evicted, 1)
+	}
+
+	entry.lastAccess = time.Now()
+	c.items[key] = entry
+	if c.items[key].timestamp.IsZero() {
+		c.size++
+	}
+}
+
+func (c *Cache) GetMetrics() map[string]int64 {
+	return map[string]int64{
+		"size":    int64(c.size),
+		"hits":    atomic.LoadInt64(&c.hits),
+		"misses":  atomic.LoadInt64(&c.misses),
+		"evicted": atomic.LoadInt64(&c.evicted),
+	}
 }
 
 func convertPolicyDocument(name, arn string, perms []types.PermissionDisplay) types.Policy {
@@ -36,203 +137,336 @@ func convertPolicyDocument(name, arn string, perms []types.PermissionDisplay) ty
 	}
 }
 
+// WorkerPool manages a pool of workers for parallel policy processing
+type WorkerPool struct {
+	numWorkers int
+	jobs       chan policyJob
+	results    chan policyResult
+	errors     chan error
+}
+
+type policyJob struct {
+	policy iamtypes.AttachedPolicy
+}
+
+type policyResult struct {
+	policy types.Policy
+	err    error
+}
+
+func newWorkerPool(numWorkers int) *WorkerPool {
+	return &WorkerPool{
+		numWorkers: numWorkers,
+		jobs:       make(chan policyJob, numWorkers),
+		results:    make(chan policyResult, numWorkers),
+		errors:     make(chan error, numWorkers),
+	}
+}
+
+func (wp *WorkerPool) start(ctx context.Context, client *Client) {
+	var wg sync.WaitGroup
+	for i := 0; i < wp.numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range wp.jobs {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					perms, err := client.GetPolicyPermissions(ctx, aws.ToString(job.policy.PolicyArn))
+					if err != nil {
+						wp.errors <- fmt.Errorf("error getting permissions for policy %s: %v",
+							aws.ToString(job.policy.PolicyArn), err)
+						continue
+					}
+					wp.results <- policyResult{
+						policy: types.Policy{
+							Name:        aws.ToString(job.policy.PolicyName),
+							Arn:         aws.ToString(job.policy.PolicyArn),
+							Permissions: perms,
+						},
+						err: nil,
+					}
+				}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(wp.results)
+		close(wp.errors)
+	}()
+}
+
 func (c *Client) GetRolePolicies(ctx context.Context, roleArn string) ([]types.Policy, error) {
-	// Add timeout to context
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
+	defer func() {
+		if time.Since(policyCache.lastSave) >= cacheSaveInterval {
+			go saveCache()
+		}
+	}()
 
 	roleName := getRoleNameFromARN(roleArn)
 	var policies []types.Policy
 
-	// Get list of policies with retries and exponential backoff
-	var result *iam.ListAttachedRolePoliciesOutput
-	var err error
-	backoff := 100 * time.Millisecond
-	maxBackoff := 2 * time.Second
-	maxRetries := 3
+	listCtx, cancel := context.WithTimeout(ctx, listPoliciesTimeout)
+	defer cancel()
 
-	for retries := 0; retries < maxRetries; retries++ {
-		if retries > 0 {
-			if backoff < maxBackoff {
-				backoff *= 2
-			}
-			time.Sleep(backoff)
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("operation timed out while listing policies for role %s", roleArn)
-		default:
-			result, err = c.iamClient.ListAttachedRolePolicies(ctx, &iam.ListAttachedRolePoliciesInput{
-				RoleName: &roleName,
-			})
-			if err == nil {
-				break
-			}
-		}
-	}
-
+	result, err := c.iamClient.ListAttachedRolePolicies(listCtx, &iam.ListAttachedRolePoliciesInput{
+		RoleName: &roleName,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list policies after %d retries: %v", maxRetries, err)
+		return nil, fmt.Errorf("failed to list policies: %v", err)
 	}
 
 	if len(result.AttachedPolicies) == 0 {
 		return policies, nil
 	}
 
-	// Create channels for results and errors
-	type policyResult struct {
-		policy types.Policy
-		err    error
-	}
-	resultChan := make(chan policyResult, len(result.AttachedPolicies))
-	errorChan := make(chan error, len(result.AttachedPolicies))
-	doneChan := make(chan struct{})
-
-	// Create a wait group to ensure all goroutines complete
+	sem := make(chan struct{}, maxConcurrentAPICalls)
 	var wg sync.WaitGroup
+	resultChan := make(chan types.Policy, len(result.AttachedPolicies))
+	errorChan := make(chan error, len(result.AttachedPolicies))
 
-	// Start a goroutine to collect results
-	go func() {
-		for res := range resultChan {
-			if res.err != nil {
-				errorChan <- res.err
-			} else {
-				policies = append(policies, res.policy)
+	cachedPolicies := make(map[string]types.Policy)
+	for _, policy := range result.AttachedPolicies {
+		if entry, ok := policyCache.Get(aws.ToString(policy.PolicyArn)); ok {
+			cachedPolicies[aws.ToString(policy.PolicyArn)] = types.Policy{
+				Name:        aws.ToString(policy.PolicyName),
+				Arn:         aws.ToString(policy.PolicyArn),
+				Permissions: entry.permissions,
 			}
 		}
-		close(doneChan)
-	}()
-
-	// Use a worker pool to limit concurrent API calls
-	const maxWorkers = 4
-	semaphore := make(chan struct{}, maxWorkers)
-
-	// Fetch permissions for each policy in parallel
-	for _, policy := range result.AttachedPolicies {
-		wg.Add(1)
-		policyName := *policy.PolicyName
-		policyArn := *policy.PolicyArn
-
-		go func() {
-			defer wg.Done()
-			semaphore <- struct{}{}        // Acquire semaphore
-			defer func() { <-semaphore }() // Release semaphore
-
-			perms, err := c.GetPolicyPermissions(ctx, policyArn)
-			if err != nil {
-				resultChan <- policyResult{err: fmt.Errorf("error getting permissions for policy %s: %v", policyArn, err)}
-				return
-			}
-
-			resultChan <- policyResult{
-				policy: types.Policy{
-					Name:        policyName,
-					Arn:         policyArn,
-					Permissions: perms,
-				},
-				err: nil,
-			}
-		}()
 	}
 
-	// Wait for all goroutines to complete and close channels
+	for _, policy := range result.AttachedPolicies {
+		policyArn := aws.ToString(policy.PolicyArn)
+		if _, ok := cachedPolicies[policyArn]; ok {
+			continue
+		}
+
+		wg.Add(1)
+		go func(p iamtypes.AttachedPolicy) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			perms, err := c.GetPolicyPermissions(ctx, aws.ToString(p.PolicyArn))
+			if err != nil {
+				errorChan <- err
+				return
+			}
+			resultChan <- types.Policy{
+				Name:        aws.ToString(p.PolicyName),
+				Arn:         aws.ToString(p.PolicyArn),
+				Permissions: perms,
+			}
+		}(policy)
+	}
+
 	go func() {
 		wg.Wait()
 		close(resultChan)
 		close(errorChan)
 	}()
 
-	// Wait for either completion or context cancellation
-	select {
-	case <-ctx.Done():
-		return policies, fmt.Errorf("operation timed out")
-	case <-doneChan:
+	for _, policy := range cachedPolicies {
+		policies = append(policies, policy)
 	}
 
-	// Check for any errors
-	select {
-	case err := <-errorChan:
-		if err != nil {
-			return policies, fmt.Errorf("error fetching policies: %v", err)
+	timeout := time.After(resultCollectTimeout)
+	var errs []error
+
+	remainingPolicies := len(result.AttachedPolicies) - len(cachedPolicies)
+	for i := 0; i < remainingPolicies; i++ {
+		select {
+		case policy := <-resultChan:
+			policies = append(policies, policy)
+		case err := <-errorChan:
+			errs = append(errs, err)
+		case <-timeout:
+			if len(policies) > 0 {
+				return policies, nil
+			}
+			return nil, fmt.Errorf("timeout while processing policies")
+		case <-ctx.Done():
+			return policies, nil
 		}
-	default:
+	}
+
+	if len(errs) > 0 && len(policies) == 0 {
+		return nil, fmt.Errorf("failed to get any policies: %v", errs[0])
 	}
 
 	return policies, nil
 }
 
-// Only call this when permissions are needed
+// Fix the Metrics struct and methods
+type Metrics struct {
+	sync.RWMutex
+	apiLatencies   map[string][]time.Duration
+	cacheHitRate   float64
+	totalAPICalls  int64
+	totalCacheHits int64
+	lastCalculated time.Time
+	lastMetrics    map[string]interface{}
+}
+
+var metrics = &Metrics{
+	apiLatencies: make(map[string][]time.Duration),
+}
+
+func (m *Metrics) recordAPILatency(operation string, duration time.Duration) {
+	m.Lock()
+	defer m.Unlock()
+
+	m.apiLatencies[operation] = append(m.apiLatencies[operation], duration)
+	atomic.AddInt64(&m.totalAPICalls, 1)
+}
+
+func (m *Metrics) recordCacheHit() {
+	atomic.AddInt64(&m.totalCacheHits, 1)
+}
+
+func (m *Metrics) GetMetrics() map[string]interface{} {
+	m.Lock()
+	defer m.Unlock()
+
+	// Only recalculate metrics every minute
+	if time.Since(m.lastCalculated) < time.Minute {
+		return m.lastMetrics
+	}
+
+	metrics := make(map[string]interface{})
+
+	// Calculate average latencies
+	for op, latencies := range m.apiLatencies {
+		var total time.Duration
+		for _, d := range latencies {
+			total += d
+		}
+		if len(latencies) > 0 {
+			metrics[op+"_avg_latency"] = total / time.Duration(len(latencies))
+		}
+	}
+
+	// Calculate cache hit rate
+	totalOps := atomic.LoadInt64(&m.totalAPICalls)
+	hits := atomic.LoadInt64(&m.totalCacheHits)
+	if totalOps > 0 {
+		m.cacheHitRate = float64(hits) / float64(totalOps)
+	}
+
+	metrics["cache_hit_rate"] = m.cacheHitRate
+	metrics["total_api_calls"] = totalOps
+	metrics["total_cache_hits"] = hits
+
+	m.lastCalculated = time.Now()
+	m.lastMetrics = metrics
+	return metrics
+}
+
+// Fix the GetPolicyPermissions method
 func (c *Client) GetPolicyPermissions(ctx context.Context, policyArn string) ([]types.PermissionDisplay, error) {
-	// Check cache first before making any API calls
-	cacheMutex.RLock()
-	if entry, ok := policyCache[policyArn]; ok && time.Since(entry.timestamp) < cacheExpiration {
-		cacheMutex.RUnlock()
-		return entry.permissions, nil
-	}
-	cacheMutex.RUnlock()
+	start := time.Now()
+	defer func() {
+		metrics.recordAPILatency("GetPolicyPermissions", time.Since(start))
+	}()
 
-	// Create channels for parallel fetching
-	type policyResult struct {
-		policy  *iam.GetPolicyOutput
-		version *iam.GetPolicyVersionOutput
-		err     error
-	}
-	resultChan := make(chan policyResult, 2)
+	quickCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
 
-	// Fetch policy and version in parallel
-	var wg sync.WaitGroup
-	wg.Add(2)
+	policy, err := c.iamClient.GetPolicy(quickCtx, &iam.GetPolicyInput{
+		PolicyArn: &policyArn,
+	})
 
-	// Fetch policy
-	go func() {
-		defer wg.Done()
-		policy, err := c.iamClient.GetPolicy(ctx, &iam.GetPolicyInput{
-			PolicyArn: &policyArn,
-		})
-		if err != nil {
-			resultChan <- policyResult{err: fmt.Errorf("failed to get policy: %v", err)}
-			return
+	if err == nil {
+		if entry, ok := policyCache.Get(policyArn); ok {
+			if entry.versionId == *policy.Policy.DefaultVersionId {
+				metrics.recordCacheHit()
+				return entry.permissions, nil
+			}
 		}
-		resultChan <- policyResult{policy: policy}
-	}()
-
-	// Fetch latest version (we'll update versionId if needed)
-	go func() {
-		defer wg.Done()
-		version, err := c.iamClient.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
-			PolicyArn: &policyArn,
-			VersionId: aws.String("v1"), // We'll update this if needed
-		})
-		if err != nil {
-			resultChan <- policyResult{err: fmt.Errorf("failed to get policy version: %v", err)}
-			return
+	} else {
+		if entry, ok := policyCache.Get(policyArn); ok {
+			metrics.recordCacheHit()
+			return entry.permissions, nil
 		}
-		resultChan <- policyResult{version: version}
-	}()
+	}
 
-	// Wait for both goroutines to complete
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
+	ctx, cancel = context.WithTimeout(ctx, getPolicyTimeout)
+	defer cancel()
 
-	// Collect results
-	var policy *iam.GetPolicyOutput
 	var version *iam.GetPolicyVersionOutput
-	for result := range resultChan {
-		if result.err != nil {
-			return nil, result.err
+	if policy != nil {
+		version, err = c.iamClient.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
+			PolicyArn: &policyArn,
+			VersionId: policy.Policy.DefaultVersionId,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get policy version: %v", err)
 		}
-		if result.policy != nil {
-			policy = result.policy
-		}
-		if result.version != nil {
-			version = result.version
+	} else {
+		policyChan := make(chan *iam.GetPolicyOutput, 1)
+		versionChan := make(chan *iam.GetPolicyVersionOutput, 1)
+		errChan := make(chan error, 2)
+
+		go func() {
+			policy, err := c.iamClient.GetPolicy(ctx, &iam.GetPolicyInput{
+				PolicyArn: &policyArn,
+			})
+			if err != nil {
+				errChan <- fmt.Errorf("failed to get policy: %v", err)
+				return
+			}
+			policyChan <- policy
+		}()
+
+		go func() {
+			version, err := c.iamClient.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
+				PolicyArn: &policyArn,
+				VersionId: aws.String("v1"),
+			})
+			if err != nil {
+				errChan <- fmt.Errorf("failed to get policy version: %v", err)
+				return
+			}
+			versionChan <- version
+		}()
+
+		timeout := time.After(apiOperationTimeout)
+
+		for i := 0; i < 2; i++ {
+			select {
+			case p := <-policyChan:
+				policy = p
+			case v := <-versionChan:
+				version = v
+			case err := <-errChan:
+				if strings.Contains(err.Error(), "v1") && policy != nil {
+					version, err = c.iamClient.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
+						PolicyArn: &policyArn,
+						VersionId: policy.Policy.DefaultVersionId,
+					})
+					if err != nil {
+						return nil, fmt.Errorf("failed to get policy version: %v", err)
+					}
+				} else {
+					return nil, err
+				}
+			case <-timeout:
+				return nil, fmt.Errorf("timeout getting policy data")
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 	}
 
-	// Parse policy document
+	if policy == nil || version == nil {
+		return nil, fmt.Errorf("failed to get complete policy data")
+	}
+
 	decodedDoc, err := url.QueryUnescape(*version.PolicyVersion.Document)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode policy document: %v", err)
@@ -245,15 +479,12 @@ func (c *Client) GetPolicyPermissions(ctx context.Context, policyArn string) ([]
 
 	perms := formatPermissions(doc.Statement)
 
-	// Cache the result with version
-	cacheMutex.Lock()
-	policyCache[policyArn] = cacheEntry{
+	policyCache.Set(policyArn, cacheEntry{
 		permissions: perms,
 		timestamp:   time.Now(),
 		versionId:   *policy.Policy.DefaultVersionId,
 		document:    doc,
-	}
-	cacheMutex.Unlock()
+	})
 
 	return perms, nil
 }
@@ -284,4 +515,82 @@ func formatPermissions(statements []Statement) []types.PermissionDisplay {
 	}
 
 	return permissions
+}
+
+// Add after Cache struct definition
+func loadCache() {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	cacheFile := filepath.Join(homeDir, cacheFileName)
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return
+	}
+
+	var pc persistentCache
+	if err := json.Unmarshal(data, &pc); err != nil {
+		return
+	}
+
+	// Only load non-expired entries
+	now := time.Now()
+	for k, v := range pc.Entries {
+		if now.Sub(v.timestamp) < cacheExpiration {
+			policyCache.Set(k, v)
+		}
+	}
+}
+
+func saveCache() {
+	policyCache.Lock()
+	defer policyCache.Unlock()
+
+	// Only save if enough time has passed since last save
+	if time.Since(policyCache.lastSave) < cacheSaveInterval {
+		return
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	cacheFile := filepath.Join(homeDir, cacheFileName)
+
+	// Only save non-expired entries
+	validEntries := make(map[string]cacheEntry)
+	now := time.Now()
+	for k, v := range policyCache.items {
+		if now.Sub(v.timestamp) < cacheExpiration {
+			validEntries[k] = v
+		}
+	}
+
+	pc := persistentCache{
+		Entries:  validEntries,
+		LastSave: now,
+	}
+
+	data, err := json.Marshal(pc)
+	if err != nil {
+		return
+	}
+
+	// Write to temporary file first
+	tempFile := cacheFile + ".tmp"
+	if err := os.WriteFile(tempFile, data, 0600); err != nil {
+		return
+	}
+
+	// Atomic rename
+	os.Rename(tempFile, cacheFile)
+	policyCache.lastSave = now
+}
+
+// Add init function to load cache at startup
+func init() {
+	loadCache()
 }
