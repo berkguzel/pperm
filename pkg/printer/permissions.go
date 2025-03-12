@@ -19,22 +19,15 @@ var (
 )
 
 func PrintPermissions(permissions []types.PodPermissions) {
-	// Add debug to see what we're getting
-	fmt.Printf("Debug: Received %d pod permissions\n", len(permissions))
-
 	for _, podPerm := range permissions {
 		fmt.Printf("\n%s Pod: %s (Namespace: %s)\n", bold("→"), podPerm.PodName, podPerm.Namespace)
 		fmt.Printf("  Service Account: %s\n", podPerm.ServiceAccount)
 		fmt.Printf("  IAM Role: %s\n", podPerm.IAMRole)
 
-		fmt.Printf("Debug: Pod has %d policies\n", len(podPerm.Policies))
-
 		for _, policy := range podPerm.Policies {
 			fmt.Printf("\n  Policy: %s\n", policy.Name)
 			fmt.Printf("  ARN: %s\n", policy.Arn)
 			fmt.Printf("  Permissions:\n")
-
-			fmt.Printf("Debug: Policy has %d permissions\n", len(policy.Permissions))
 
 			for _, perm := range policy.Permissions {
 				icon := checkmark

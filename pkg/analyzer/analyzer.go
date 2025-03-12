@@ -101,11 +101,6 @@ func AnalyzePodPermissions(pod *corev1.Pod, awsClient *aws.Client) (types.PodPer
 		return types.PodPermissions{}, fmt.Errorf("failed to get role policies: %v", err)
 	}
 
-	fmt.Printf("Debug: Analyzer found %d policies with permissions\n", len(policies))
-	for _, policy := range policies {
-		fmt.Printf("Debug: Policy %s has %d permissions\n", policy.Name, len(policy.Permissions))
-	}
-
 	podPerms := types.PodPermissions{
 		PodName:        pod.Name,
 		Namespace:      pod.Namespace,
