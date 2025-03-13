@@ -13,8 +13,14 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+// KubernetesClient defines the interface for our Kubernetes operations
+type KubernetesClient interface {
+	GetPod(ctx context.Context, name, namespace string) (analyzer.Pod, error)
+	GetServiceAccountIAMRole(ctx context.Context, namespace, name string) (string, error)
+}
+
 type Client struct {
-	clientset *kubernetes.Clientset
+	clientset kubernetes.Interface
 }
 
 func NewClient() (*Client, error) {

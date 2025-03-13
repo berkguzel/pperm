@@ -10,8 +10,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 )
 
+type IAMClient interface {
+	GetPolicy(ctx context.Context, params *iam.GetPolicyInput, optFns ...func(*iam.Options)) (*iam.GetPolicyOutput, error)
+	GetPolicyVersion(ctx context.Context, params *iam.GetPolicyVersionInput, optFns ...func(*iam.Options)) (*iam.GetPolicyVersionOutput, error)
+	ListAttachedRolePolicies(ctx context.Context, params *iam.ListAttachedRolePoliciesInput, optFns ...func(*iam.Options)) (*iam.ListAttachedRolePoliciesOutput, error)
+}
+
 type Client struct {
-	iamClient *iam.Client
+	iamClient IAMClient
 }
 
 func NewClient() (*Client, error) {
