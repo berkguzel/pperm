@@ -1,5 +1,10 @@
 # `pperm`: Kubernetes Pod Permission Analyzer for AWS IAM
 
+## 🙏 Acknowledgments
+
+This project was developed with the assistance of [Cursor AI](https://cursor.sh/).
+
+
 `pperm` is a kubectl plugin that helps you analyze and audit AWS IAM permissions associated with your Kubernetes pods. It provides a quick and efficient way to understand what permissions your pods have through their service accounts and IAM roles, helping you identify security risks and ensure proper access controls.
 
 
@@ -178,10 +183,6 @@ Contributions are welcome! Here's how you can help:
 5. Open a Pull Request
 
 Please make sure to update tests as appropriate.
-
-## 🙏 Acknowledgments
-
-This project was developed with the assistance of [Cursor AI](https://cursor.sh/).
 
 ## 📝 License
 
