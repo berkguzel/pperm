@@ -2,15 +2,17 @@ package aws
 
 // Internal AWS types for policy parsing
 type Statement struct {
-	Effect    string                 `json:"Effect"`
-	Action    interface{}            `json:"Action"`    // Can be string or []string
-	Resource  interface{}            `json:"Resource"`  // Can be string or []string
-	Condition map[string]interface{} `json:"Condition"` // For IAM policy conditions
+	Effect    string                            `json:"Effect"`
+	Action    interface{}                       `json:"Action"`              // Can be string or []string
+	Resource  interface{}                       `json:"Resource"`            // Can be string or []string
+	Condition map[string]map[string]interface{} `json:"Condition,omitempty"` // For IAM policy conditions
+	Principal interface{}                       `json:"Principal,omitempty"`
+	Sid       string                            `json:"Sid,omitempty"`
 }
 
 type PolicyDocument struct {
-	Version   string
-	Statement []Statement
+	Version   string      `json:"Version"`
+	Statement []Statement `json:"Statement"`
 }
 
 type Permission struct {
