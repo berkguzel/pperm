@@ -61,10 +61,8 @@ kubectl pperm <pod-name> --permissions
 kubectl pperm <pod-name> --risk-only
 
 # Inspect specific policies interactively
-kubectl pperm <pod-name> -i
+kubectl pperm <pod-name> --inspect-policy
 
-# Specify a different namespace
-kubectl pperm <pod-name> -n <namespace>
 ```
 
 ### Examples
@@ -180,6 +178,10 @@ Contributions are welcome! Here's how you can help:
 5. Open a Pull Request
 
 Please make sure to update tests as appropriate.
+
+## 🙏 Acknowledgments
+
+This project was developed with the assistance of [Cursor AI](https://cursor.sh/).
 
 ## 📝 License
 
