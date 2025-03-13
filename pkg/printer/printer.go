@@ -189,10 +189,16 @@ func determineResourceScope(permissions []types.PermissionDisplay) string {
 }
 
 func determineConditions(policy types.Policy) string {
+	hasConditions := false
 	for _, perm := range policy.Permissions {
 		if perm.HasCondition {
-			return "Yes"
+			hasConditions = true
+			break
 		}
+	}
+
+	if hasConditions {
+		return "Yes"
 	}
 	return "No"
 }
