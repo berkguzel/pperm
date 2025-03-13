@@ -9,10 +9,18 @@ require (
 	k8s.io/client-go v0.28.2
 )
 
-require github.com/mitchellh/go-homedir v1.1.0
+require (
+	github.com/mitchellh/go-homedir v1.1.0
+	github.com/stretchr/testify v1.8.2
+)
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.21.0 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/stretchr/objx v0.5.0 // indirect
+)
+
+require (
+	github.com/aws/aws-sdk-go-v2 v1.21.0
 	github.com/aws/aws-sdk-go-v2/credentials v1.13.38 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.13.11 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.1.41 // indirect
@@ -56,7 +64,7 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	k8s.io/api v0.28.2 // indirect
+	k8s.io/api v0.28.2
 	k8s.io/apimachinery v0.28.2
 	k8s.io/klog/v2 v2.100.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20230717233707-2695361300d9 // indirect
