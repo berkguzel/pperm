@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,15 +29,16 @@ const (
 
 // Add timeout constants
 const (
-	listPoliciesTimeout  = 2 * time.Second
-	getPolicyTimeout     = 1 * time.Second
-	resultCollectTimeout = 3 * time.Second
-	apiOperationTimeout  = 750 * time.Millisecond
+	listPoliciesTimeout  = 10 * time.Second
+	getPolicyTimeout     = 10 * time.Second
+	resultCollectTimeout = 15 * time.Second
+	apiOperationTimeout  = 5 * time.Second
 )
 
 // Add at the top of the file after imports
 const cacheFileName = ".pperm_cache.json"
 
+// Remove persistent cache
 type cacheEntry struct {
 	permissions []types.PermissionDisplay
 	timestamp   time.Time
@@ -51,21 +50,15 @@ type cacheEntry struct {
 // Cache with TTL and LRU eviction
 type Cache struct {
 	sync.RWMutex
-	items    map[string]cacheEntry
-	size     int
-	hits     int64
-	misses   int64
-	evicted  int64
-	lastSave time.Time
+	items   map[string]cacheEntry
+	size    int
+	hits    int64
+	misses  int64
+	evicted int64
 }
 
 var policyCache = &Cache{
 	items: make(map[string]cacheEntry),
-}
-
-type persistentCache struct {
-	Entries  map[string]cacheEntry `json:"entries"`
-	LastSave time.Time             `json:"last_save"`
 }
 
 func (c *Cache) Get(key string) (cacheEntry, bool) {
@@ -86,6 +79,27 @@ func (c *Cache) Get(key string) (cacheEntry, bool) {
 		return cacheEntry{}, false
 	}
 
+	// Validate the entry
+	valid := true
+	for _, stmt := range entry.document.Statement {
+		hasCondition := stmt.Condition != nil && len(stmt.Condition) > 0
+		for _, perm := range entry.permissions {
+			if (hasCondition && !perm.HasCondition) || (!hasCondition && perm.HasCondition) {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			break
+		}
+	}
+
+	if !valid {
+		delete(c.items, key)
+		c.size--
+		return cacheEntry{}, false
+	}
+
 	// Update last access time
 	entry.lastAccess = time.Now()
 	c.items[key] = entry
@@ -97,6 +111,25 @@ func (c *Cache) Get(key string) (cacheEntry, bool) {
 func (c *Cache) Set(key string, entry cacheEntry) {
 	c.Lock()
 	defer c.Unlock()
+
+	// Validate the entry before caching
+	valid := true
+	for _, stmt := range entry.document.Statement {
+		hasCondition := stmt.Condition != nil && len(stmt.Condition) > 0
+		for _, perm := range entry.permissions {
+			if (hasCondition && !perm.HasCondition) || (!hasCondition && perm.HasCondition) {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			break
+		}
+	}
+
+	if !valid {
+		return
+	}
 
 	// If cache is full, remove least recently used entries
 	if c.size >= maxCacheSize && c.items[key].timestamp.IsZero() {
@@ -201,102 +234,58 @@ func (wp *WorkerPool) start(ctx context.Context, client *Client) {
 }
 
 func (c *Client) GetRolePolicies(ctx context.Context, roleArn string) ([]types.Policy, error) {
-	defer func() {
-		if time.Since(policyCache.lastSave) >= cacheSaveInterval {
-			go saveCache()
-		}
-	}()
-
 	roleName := getRoleNameFromARN(roleArn)
 	var policies []types.Policy
 
-	listCtx, cancel := context.WithTimeout(ctx, listPoliciesTimeout)
-	defer cancel()
-
-	result, err := c.iamClient.ListAttachedRolePolicies(listCtx, &iam.ListAttachedRolePoliciesInput{
+	result, err := c.iamClient.ListAttachedRolePolicies(ctx, &iam.ListAttachedRolePoliciesInput{
 		RoleName: &roleName,
 	})
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to list policies: %v", err)
+		return nil, fmt.Errorf("failed to list attached role policies: %v", err)
 	}
 
-	if len(result.AttachedPolicies) == 0 {
-		return policies, nil
-	}
-
-	sem := make(chan struct{}, maxConcurrentAPICalls)
 	var wg sync.WaitGroup
-	resultChan := make(chan types.Policy, len(result.AttachedPolicies))
+	var mu sync.Mutex
 	errorChan := make(chan error, len(result.AttachedPolicies))
 
-	cachedPolicies := make(map[string]types.Policy)
+	// DISABLE CACHE - Always fetch fresh data
 	for _, policy := range result.AttachedPolicies {
-		if entry, ok := policyCache.Get(aws.ToString(policy.PolicyArn)); ok {
-			cachedPolicies[aws.ToString(policy.PolicyArn)] = types.Policy{
-				Name:        aws.ToString(policy.PolicyName),
-				Arn:         aws.ToString(policy.PolicyArn),
-				Permissions: entry.permissions,
-			}
-		}
-	}
-
-	for _, policy := range result.AttachedPolicies {
-		policyArn := aws.ToString(policy.PolicyArn)
-		if _, ok := cachedPolicies[policyArn]; ok {
-			continue
-		}
-
 		wg.Add(1)
 		go func(p iamtypes.AttachedPolicy) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 
-			perms, err := c.GetPolicyPermissions(ctx, aws.ToString(p.PolicyArn))
+			policyArn := aws.ToString(p.PolicyArn)
+			policyName := aws.ToString(p.PolicyName)
+
+			perms, err := c.GetPolicyPermissions(ctx, policyArn)
 			if err != nil {
-				errorChan <- err
+				errorChan <- fmt.Errorf("failed to get policy permissions for %s: %v", policyArn, err)
 				return
 			}
-			resultChan <- types.Policy{
-				Name:        aws.ToString(p.PolicyName),
-				Arn:         aws.ToString(p.PolicyArn),
+
+			mu.Lock()
+			policies = append(policies, types.Policy{
+				Name:        policyName,
+				Arn:         policyArn,
 				Permissions: perms,
-			}
+			})
+			mu.Unlock()
 		}(policy)
 	}
 
 	go func() {
 		wg.Wait()
-		close(resultChan)
 		close(errorChan)
 	}()
 
-	for _, policy := range cachedPolicies {
-		policies = append(policies, policy)
-	}
-
-	timeout := time.After(resultCollectTimeout)
 	var errs []error
-
-	remainingPolicies := len(result.AttachedPolicies) - len(cachedPolicies)
-	for i := 0; i < remainingPolicies; i++ {
-		select {
-		case policy := <-resultChan:
-			policies = append(policies, policy)
-		case err := <-errorChan:
-			errs = append(errs, err)
-		case <-timeout:
-			if len(policies) > 0 {
-				return policies, nil
-			}
-			return nil, fmt.Errorf("timeout while processing policies")
-		case <-ctx.Done():
-			return policies, nil
-		}
+	for err := range errorChan {
+		errs = append(errs, err)
 	}
 
-	if len(errs) > 0 && len(policies) == 0 {
-		return nil, fmt.Errorf("failed to get any policies: %v", errs[0])
+	if len(errs) > 0 {
+		return policies, fmt.Errorf("errors getting policy permissions: %v", errs)
 	}
 
 	return policies, nil
@@ -374,97 +363,29 @@ func (c *Client) GetPolicyPermissions(ctx context.Context, policyArn string) ([]
 		metrics.recordAPILatency("GetPolicyPermissions", time.Since(start))
 	}()
 
-	quickCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	// DISABLE CACHE COMPLETELY - Always fetch fresh data
+
+	quickCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	policy, err := c.iamClient.GetPolicy(quickCtx, &iam.GetPolicyInput{
 		PolicyArn: &policyArn,
 	})
 
-	if err == nil {
-		if entry, ok := policyCache.Get(policyArn); ok {
-			if entry.versionId == *policy.Policy.DefaultVersionId {
-				metrics.recordCacheHit()
-				return entry.permissions, nil
-			}
-		}
-	} else {
-		if entry, ok := policyCache.Get(policyArn); ok {
-			metrics.recordCacheHit()
-			return entry.permissions, nil
-		}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get policy: %v", err)
 	}
 
-	ctx, cancel = context.WithTimeout(ctx, getPolicyTimeout)
-	defer cancel()
+	versionCtx, versionCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer versionCancel()
 
-	var version *iam.GetPolicyVersionOutput
-	if policy != nil {
-		version, err = c.iamClient.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
-			PolicyArn: &policyArn,
-			VersionId: policy.Policy.DefaultVersionId,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to get policy version: %v", err)
-		}
-	} else {
-		policyChan := make(chan *iam.GetPolicyOutput, 1)
-		versionChan := make(chan *iam.GetPolicyVersionOutput, 1)
-		errChan := make(chan error, 2)
+	version, err := c.iamClient.GetPolicyVersion(versionCtx, &iam.GetPolicyVersionInput{
+		PolicyArn: &policyArn,
+		VersionId: policy.Policy.DefaultVersionId,
+	})
 
-		go func() {
-			policy, err := c.iamClient.GetPolicy(ctx, &iam.GetPolicyInput{
-				PolicyArn: &policyArn,
-			})
-			if err != nil {
-				errChan <- fmt.Errorf("failed to get policy: %v", err)
-				return
-			}
-			policyChan <- policy
-		}()
-
-		go func() {
-			version, err := c.iamClient.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
-				PolicyArn: &policyArn,
-				VersionId: aws.String("v1"),
-			})
-			if err != nil {
-				errChan <- fmt.Errorf("failed to get policy version: %v", err)
-				return
-			}
-			versionChan <- version
-		}()
-
-		timeout := time.After(apiOperationTimeout)
-
-		for i := 0; i < 2; i++ {
-			select {
-			case p := <-policyChan:
-				policy = p
-			case v := <-versionChan:
-				version = v
-			case err := <-errChan:
-				if strings.Contains(err.Error(), "v1") && policy != nil {
-					version, err = c.iamClient.GetPolicyVersion(ctx, &iam.GetPolicyVersionInput{
-						PolicyArn: &policyArn,
-						VersionId: policy.Policy.DefaultVersionId,
-					})
-					if err != nil {
-						return nil, fmt.Errorf("failed to get policy version: %v", err)
-					}
-				} else {
-					return nil, err
-				}
-			case <-timeout:
-				return nil, fmt.Errorf("timeout getting policy data")
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-	}
-
-	if policy == nil || version == nil {
-		return nil, fmt.Errorf("failed to get complete policy data")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get policy version: %v", err)
 	}
 
 	decodedDoc, err := url.QueryUnescape(*version.PolicyVersion.Document)
@@ -479,13 +400,6 @@ func (c *Client) GetPolicyPermissions(ctx context.Context, policyArn string) ([]
 
 	perms := formatPermissions(doc.Statement)
 
-	policyCache.Set(policyArn, cacheEntry{
-		permissions: perms,
-		timestamp:   time.Now(),
-		versionId:   *policy.Policy.DefaultVersionId,
-		document:    doc,
-	})
-
 	return perms, nil
 }
 
@@ -495,102 +409,28 @@ func formatPermissions(statements []Statement) []types.PermissionDisplay {
 	for _, stmt := range statements {
 		actions := getActions(stmt.Action)
 		resources := getResources(stmt.Resource)
-		hasCondition := len(stmt.Condition) > 0
+
+		// Explicit condition check
+		hasCondition := stmt.Condition != nil && len(stmt.Condition) > 0
 
 		for _, action := range actions {
 			for _, resource := range resources {
 				isBroad := strings.Contains(action, "*") || strings.Contains(resource, "*")
 				isHighRisk := isHighRiskService(action)
 
-				permissions = append(permissions, types.PermissionDisplay{
+				perm := types.PermissionDisplay{
 					Action:       action,
 					Resource:     resource,
 					Effect:       stmt.Effect,
 					IsBroad:      isBroad,
 					IsHighRisk:   isHighRisk,
 					HasCondition: hasCondition,
-				})
+				}
+
+				permissions = append(permissions, perm)
 			}
 		}
 	}
 
 	return permissions
-}
-
-// Add after Cache struct definition
-func loadCache() {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-
-	cacheFile := filepath.Join(homeDir, cacheFileName)
-	data, err := os.ReadFile(cacheFile)
-	if err != nil {
-		return
-	}
-
-	var pc persistentCache
-	if err := json.Unmarshal(data, &pc); err != nil {
-		return
-	}
-
-	// Only load non-expired entries
-	now := time.Now()
-	for k, v := range pc.Entries {
-		if now.Sub(v.timestamp) < cacheExpiration {
-			policyCache.Set(k, v)
-		}
-	}
-}
-
-func saveCache() {
-	policyCache.Lock()
-	defer policyCache.Unlock()
-
-	// Only save if enough time has passed since last save
-	if time.Since(policyCache.lastSave) < cacheSaveInterval {
-		return
-	}
-
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-
-	cacheFile := filepath.Join(homeDir, cacheFileName)
-
-	// Only save non-expired entries
-	validEntries := make(map[string]cacheEntry)
-	now := time.Now()
-	for k, v := range policyCache.items {
-		if now.Sub(v.timestamp) < cacheExpiration {
-			validEntries[k] = v
-		}
-	}
-
-	pc := persistentCache{
-		Entries:  validEntries,
-		LastSave: now,
-	}
-
-	data, err := json.Marshal(pc)
-	if err != nil {
-		return
-	}
-
-	// Write to temporary file first
-	tempFile := cacheFile + ".tmp"
-	if err := os.WriteFile(tempFile, data, 0600); err != nil {
-		return
-	}
-
-	// Atomic rename
-	os.Rename(tempFile, cacheFile)
-	policyCache.lastSave = now
-}
-
-// Add init function to load cache at startup
-func init() {
-	loadCache()
 }
