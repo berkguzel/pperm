@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/mitchellh/go-homedir"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 type Options struct {
@@ -19,6 +20,34 @@ type Options struct {
 	Help          bool
 }
 
+// getCurrentNamespace gets the current namespace from the kubeconfig
+func getCurrentNamespace(kubeconfigPath string) string {
+	// Load the kubeconfig file
+	config, err := clientcmd.LoadFromFile(kubeconfigPath)
+	if err != nil {
+		return "default" // Fall back to default namespace on error
+	}
+
+	// Get the current context
+	currentContext := config.CurrentContext
+	if currentContext == "" {
+		return "default"
+	}
+
+	// Get the context details
+	context, exists := config.Contexts[currentContext]
+	if !exists || context == nil {
+		return "default"
+	}
+
+	// Get the namespace from the context
+	if context.Namespace != "" {
+		return context.Namespace
+	}
+
+	return "default"
+}
+
 func printUsage() {
 	fmt.Printf(`Usage: kubectl pperm [flags] POD_NAME
 
@@ -27,11 +56,12 @@ Display AWS IAM permissions for pods in Kubernetes clusters.
 Flags:
   -h, --help              Show help message
   -i, --inspect-policy    Inspect detailed policy information
-  -r, --risk-only        Show only permissions with high risk or broad scope
-  --permissions          Show detailed permissions list
+  -r, --risk-only         Show only permissions with high risk or broad scope
+  --permissions           Show detailed permissions list
+  -n, --namespace         Namespace of the pod (defaults to current namespace)
 
 Examples:
-  # Show policy overview (default)
+  # Show policy overview (default behavior)
   kubectl pperm my-pod
 
   # Show only high-risk permissions
@@ -43,7 +73,9 @@ Examples:
   # Inspect detailed policy information
   kubectl pperm my-pod -i
 
-Kubernetes flags like -n/--namespace are also supported.
+  # Specify a namespace
+  kubectl pperm my-pod -n my-namespace
+
 `)
 }
 
@@ -58,9 +90,12 @@ func NewOptions() *Options {
 		kubeconfig = filepath.Join(home, ".kube", "config")
 	}
 
+	// Get the current namespace from kubeconfig
+	currentNamespace := getCurrentNamespace(kubeconfig)
+
 	return &Options{
 		KubeConfig: kubeconfig,
-		Namespace:  "default",
+		Namespace:  currentNamespace,
 	}
 }
 

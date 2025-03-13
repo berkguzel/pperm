@@ -24,11 +24,6 @@ func main() {
 	}
 
 	// Validate required fields
-	if opts.Namespace == "" {
-		fmt.Fprintln(os.Stderr, "Error: namespace (-n) is required")
-		os.Exit(1)
-	}
-
 	if opts.PodName == "" {
 		fmt.Fprintln(os.Stderr, "Error: pod name is required")
 		os.Exit(1)
