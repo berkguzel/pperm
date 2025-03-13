@@ -2,11 +2,20 @@ package printer
 
 import (
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/berkguzel/pperm/internal/options"
 	"github.com/berkguzel/pperm/pkg/types"
 )
+
+type Printer struct {
+	writer io.Writer
+}
+
+func New(w io.Writer) *Printer {
+	return &Printer{writer: w}
+}
 
 func Print(perms []types.PodPermissions, opts *options.Options) error {
 	if opts.InspectPolicy {
