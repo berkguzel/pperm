@@ -3,6 +3,7 @@ package analyzer
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/berkguzel/pperm/internal/options"
 	"github.com/berkguzel/pperm/pkg/aws"
@@ -77,7 +78,9 @@ func (a *Analyzer) analyzePod(ctx context.Context, podName, namespace string, op
 }
 
 func (a *Analyzer) Analyze(opts *options.Options) ([]types.PodPermissions, error) {
-	ctx := context.Background()
+	// Create a context with a 30-second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	if opts.PodName != "" {
 		return a.analyzePod(ctx, opts.PodName, opts.Namespace, opts)
@@ -96,7 +99,11 @@ func AnalyzePodPermissions(pod *corev1.Pod, awsClient *aws.Client) (types.PodPer
 	// Get IAM role from service account annotations
 	iamRole := pod.Spec.ServiceAccountName // TODO: Get actual IAM role from annotations
 
-	policies, err := awsClient.GetRolePolicies(context.Background(), iamRole)
+	// Create a context with a 30-second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	policies, err := awsClient.GetRolePolicies(ctx, iamRole)
 	if err != nil {
 		return types.PodPermissions{}, fmt.Errorf("failed to get role policies: %v", err)
 	}
