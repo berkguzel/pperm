@@ -46,7 +46,12 @@ chmod +x pperm
 sudo mv pperm /usr/local/bin/kubectl-pperm
 ```
 
-4. Verify the installation:
+4. Set your AWS profile:
+```bash
+export AWS_PROFILE=
+```
+
+5. Verify the installation:
 ```bash
 kubectl pperm --help
 ```
